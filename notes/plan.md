@@ -46,26 +46,46 @@ GPU는 비용이 발생하므로 최대한 로컬(CPU)에서 준비하고, GPU�
 {
   "question": "...",
   "answers": ["..."],
-  "positive_ctxs": [{"title": "...", "text": "...", "passage_id": "..."}],
+  "positive_ctxs": [{"title": "...", "text": "..."}],
+  "negative_ctxs": [...],
   "hard_negative_ctxs": [{"title": "...", "text": "..."}]
 }
 ```
 
-**확인 포인트**: `hard_negative_ctxs`가 어떻게 생성되었는지 공식 코드에서 확인
-→ BM25 상위 결과 중 정답 문자열이 없는 passage를 선택하는 로직
+- `negative_ctxs`: 랜덤 negative — 현재 공식 코드에서 실제로 사용하지 않음
+- `hard_negative_ctxs`: BM25 상위 결과 중 정답 문자열이 없는 passage → 학습에 사용
+
+**hard negative 흐름**
+
+생성은 DPR 레포 밖에서 수행됨. 공식 배포 JSON에 이미 포함된 상태로 제공되며, 생성 스크립트는 레포에 없음.
+직접 생성하려면 Elasticsearch/Pyserini로 BM25 인덱스를 만들어 별도 처리해야 함.
+
+| 단계 | 위치 | 내용 |
+|------|------|------|
+| 생성 | 레포 외부 (Elasticsearch) | BM25 상위 결과 중 정답 문자열 없는 passage 추출 |
+| 읽기 | `dpr/data/biencoder_data.py` L84 | JSON에서 통째로 읽어옴, 개수 제한 없음 |
+| 선택 | `dpr/models/biencoder.py` `create_biencoder_input()` | `hard_neg_ctxs[0:num_hard_negatives]` → 1개 슬라이싱 후 배치에 합침 |
+
+`num_hard_negatives=1`은 `conf/train/biencoder_nq.yaml`의 `hard_negatives: 1`에서 설정됨.
 
 ### 1-2. 다운로드 스크립트 작성 (`scripts/01_download_data.sh`)
 
 GPU 서버 세팅 시 한 번에 실행할 수 있도록 준비만 해둔다.
+공식 레포의 `download_data.py`를 사용한다 (prefix 기반 매칭).
 
 ```bash
-# Wikipedia passages
-wget https://dl.fbaipublicfiles.com/dpr/wikipedia_split/psgs_w100.tsv.gz
+# 공식 DPR 레포 클론
+git clone https://github.com/facebookresearch/DPR.git
+cd DPR && pip install .
 
-# NQ 데이터
-wget https://dl.fbaipublicfiles.com/dpr/data/retriever/biencoder-nq-train.json.gz
-wget https://dl.fbaipublicfiles.com/dpr/data/retriever/biencoder-nq-dev.json.gz
-wget https://dl.fbaipublicfiles.com/dpr/data/retriever/nq-test.qa.csv
+# Wikipedia passages (~14GB)
+python data/download_data.py --resource data.wikipedia_split.psgs_w100
+
+# NQ retriever 학습 데이터 (train/dev, JSON 포맷)
+python data/download_data.py --resource data.retriever.nq
+
+# NQ 평가용 QA CSV (dev/test)
+python data/download_data.py --resource data.retriever.qas.nq
 ```
 
 ### 1-3. 소규모 실험용 미니 데이터 (로컬용)
@@ -131,63 +151,93 @@ CPU에서 소규모로 동작 확인:
 
 ---
 
-## Phase 3: 학습 (`scripts/04_train_retriever.py`)
+## Phase 3: 학습
+
+공식 레포의 `train_dense_encoder.py`를 Hydra 설정과 함께 사용한다.
+설정 파일: `conf/train/biencoder_nq.yaml`
+
+### 실행 명령
+
+```bash
+# 풀 학습 (8 GPU, 분산 학습)
+python -m torch.distributed.launch --nproc_per_node=8 \
+  train_dense_encoder.py \
+  train=biencoder_nq \
+  train_datasets=[nq_train] \
+  dev_datasets=[nq_dev] \
+  output_dir={체크포인트 저장 경로}
+```
 
 ### 하이퍼파라미터
 
-| 설정 | 논문 | 미니 실험 |
-|------|------|-----------|
-| Batch size | 128 | 32 |
+| 설정 | 논문/공식 레포 | 미니 실험 |
+|------|--------------|-----------|
+| Batch size | 128 (GPU당) | 32 |
 | Learning rate | 1e-5 | 1e-5 |
 | Epochs | 40 | 5~10 |
 | Hard negative | BM25 1개 | BM25 1개 |
 | Max passage length | 256 tokens | 256 tokens |
 | Max question length | 64 tokens | 64 tokens |
+| 검증 방식 | epoch 30까지 NLL loss, 이후 Average Rank | NLL loss |
 
 ### 학습 순서
 
 1. **미니 실험 (GPU 렌탈 초반)**: NQ 5K + 배치 32 → loss 감소 확인
-2. **풀 학습**: NQ 전체 58K + 배치 128 → 40 epochs
+2. **풀 학습**: NQ 전체 58K + 배치 128 → 40 epochs (~1일 소요)
 
-### 체크포인트 저장
+### 체크포인트
 
-- `outputs/checkpoints/dpr_nq_epoch{N}.pt`
-- best dev Top-20 accuracy 기준으로 저장
+- 공식 레포는 매 validation마다 저장, **보통 마지막 체크포인트가 best**
+- epoch ~25 이후부터 Average Rank가 25 이하로 수렴하는지 확인
 
 ---
 
 ## Phase 4: 인덱스 구축 및 평가
 
-### 4-1. Passage 임베딩 추출 (`scripts/05_encode_passages.py`)
+### 4-1. Passage 임베딩 추출
 
-- 학습된 passage encoder로 21M passages를 임베딩
-- 배치 단위로 처리 후 `.npy` 파일로 저장
+공식 레포의 `generate_dense_embeddings.py` 사용. 샤딩으로 병렬 처리 가능.
+
+```bash
+python generate_dense_embeddings.py \
+  model_file={체크포인트 경로} \
+  ctx_src=dpr_wiki \
+  shard_id={0부터} num_shards={총 샤드 수} \
+  out_file={출력 경로 prefix} \
+  batch_size=128
+```
+
 - 예상 크기: 21M × 768 × 4bytes ≈ 64GB
+- 단일 GPU면 shard 나눠서 순차 실행
 
-### 4-2. FAISS 인덱스 구축 (`scripts/05_build_index.py`)
+### 4-2. FAISS 인덱스 구축 + Retrieval 평가
 
-논문 설정:
-```python
-# HNSW 인덱스
-index = faiss.IndexHNSWFlat(768, 512)    # d=768, M=512
-index.hnsw.efConstruction = 200
-index.hnsw.efSearch = 128
+공식 레포의 `dense_retriever.py`가 인덱스 구축과 평가를 함께 처리한다.
+
+```bash
+python dense_retriever.py \
+  model_file={체크포인트} \
+  qa_dataset=nq_test \
+  ctx_datatsets=[dpr_wiki] \
+  encoded_ctx_files=["{임베딩 파일 glob}"] \
+  out_file={결과 json 경로}
 ```
 
-### 4-3. Top-k Accuracy 평가 (`scripts/06_evaluate_retriever.py`)
+- 기본 인덱스: **exhaustive (flat)** — 정확도 최대
+- HNSW 옵션(`indexer=hnsw`): 검색 빠르지만 인덱스 구축 오래 걸리고 RAM 많이 씀
+- 재현 목적이므로 **flat 인덱스** 사용
 
-```
-평가 지표: Top-k accuracy (k=1, 5, 20, 100)
-= 정답 passage가 top-k 안에 포함된 질문의 비율
-```
+### 4-3. 목표 수치
 
-목표:
-| | BM25 (논문) | DPR (논문) | 재현 |
-|-|------------|------------|------|
-| Top-20 | 59.1% | 78.4% | ? |
-| Top-100 | 73.7% | 85.4% | ? |
+| | BM25 (논문) | DPR 논문 | 공식 레포 모델 | 재현 |
+|-|------------|---------|--------------|------|
+| Top-20 | 59.1% | 78.4% | **79.97%** | ? |
+| Top-100 | 73.7% | 85.4% | **85.87%** | ? |
 
-BM25 수치는 Pyserini로 직접 재현해서 기준선 확인.
+> 논문 수치(78.4%)와 공식 레포 제공 체크포인트 수치(79.97%)가 다소 다름.
+> 재현 목표는 **논문 기준 78.4%** 이상으로 잡는다.
+
+BM25 기준선은 Pyserini로 직접 측정.
 
 ---
 
@@ -217,8 +267,8 @@ Retriever Top-20 accuracy 재현 후 시간/여력에 따라 결정.
 |------|----------|
 | 논문 | `2004.04906v3.pdf` |
 | 논문 정리 | `DPR_논문정리.md` |
+| 공식 레포 요약 | `notes/official_repo_summary.md` |
 | 공식 코드 | https://github.com/facebookresearch/DPR |
-| 공식 데이터 | DPR 레포 README의 "Resources" 섹션 |
 | Pyserini (BM25) | https://github.com/castorini/pyserini |
 
 ---
