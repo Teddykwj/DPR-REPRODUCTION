@@ -7,15 +7,19 @@ set -euo pipefail
 DATA_DIR="${1:-./data}"
 SKIP_WIKI="${SKIP_WIKI:-0}"
 
+# 이후 DPR/ 로 cd하므로, 상대경로가 엉뚱한 곳(DPR/data)을 가리키지 않도록 절대경로로 고정
+mkdir -p "$DATA_DIR"
+DATA_DIR="$(cd "$DATA_DIR" && pwd)"
+
 # ── 1. 공식 DPR 레포 클론 ──────────────────────────────────────────────────────
 if [ ! -d "DPR" ]; then
     git clone https://github.com/facebookresearch/DPR.git
 fi
 cd DPR
-# pip install -e .는 최신 setuptools의 엄격해진 flat-layout 자동 탐지 때문에
-# 오래된 이 레포(setup.py가 packages를 명시하지 않음)에서 실패한다.
-# 레거시 경로(python setup.py develop)는 그 검증을 타지 않아 우회된다.
-python setup.py develop -q
+# pip install -e . / python setup.py develop 둘 다 최신 setuptools의 엄격해진
+# flat-layout 자동 탐지(오래된 이 레포의 setup.py가 packages를 명시 안 함) 때문에 실패한다.
+# 패키지 설치 자체를 생략하고, PYTHONPATH로 dpr 모듈만 바로 import 가능하게 만든다.
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 # ── 2. Wikipedia passages (psgs_w100.tsv, ~14GB) ──────────────────────────────
 if [ "$SKIP_WIKI" = "1" ]; then
