@@ -68,10 +68,10 @@ GPU는 비용이 발생하므로 최대한 로컬(CPU)에서 준비하고, GPU�
 
 `num_hard_negatives=1`은 `conf/train/biencoder_nq.yaml`의 `hard_negatives: 1`에서 설정됨.
 
-### 1-2. 다운로드 스크립트 작성 (`scripts/01_download_data.sh`)
+### 1-2. 다운로드 스크립트 작성 (`scripts/01_download_data/`)
 
 GPU 서버 세팅 시 한 번에 실행할 수 있도록 준비만 해둔다.
-공식 레포의 `download_data.py`를 사용한다 (prefix 기반 매칭).
+공식 레포의 `download_data.py`를 데이터 다운로드 용도로만 사용한다 (prefix 기반 매칭) — 모델 코드와 무관하므로 여기서만 예외적으로 공식 스크립트를 그대로 활용.
 
 ```bash
 # 공식 DPR 레포 클론
@@ -88,10 +88,11 @@ python data/download_data.py --resource data.retriever.nq
 python data/download_data.py --resource data.retriever.qas.nq
 ```
 
-### 1-3. 소규모 실험용 미니 데이터 (로컬용)
+### 1-3. 소규모 실험용 미니 데이터
 
-NQ json에서 처음 200개만 뽑은 파일을 로컬에 만들어둔다.
-→ 모델 코드 작성 후 CPU에서 forward pass, loss 동작 확인에 사용.
+별도 파일을 미리 만들어두지 않는다. 대신:
+- **모델 동작 확인** (`scripts/02_model_impl/model_check.ipynb`): 하드코딩한 더미 문장 4개로 shape/loss 확인 (NQ 데이터 불필요)
+- **미니 학습** (`scripts/03_train/train_kaggle.ipynb`): `MAX_SAMPLES` 값으로 NQ train json을 런타임에 슬라이싱 (`MINI=True` → 5,000개)
 
 ---
 
@@ -132,9 +133,9 @@ BM25 hard negative 추가 시:
 ### 2-3. Dataset & DataLoader (`src/data/dataset.py`)
 
 ```python
-class DPRDataset
+class NQDataset
   - NQ json 로드
-  - 배치 구성: 질문 + positive + hard_negative 1개
+  - __getitem__: 질문 + positive 1개(랜덤) + hard_negative 1개 반환
   - tokenize (BERT tokenizer, max_length=256 for passage, 64 for question)
 
 class DPRCollator
@@ -142,7 +143,7 @@ class DPRCollator
   - in-batch negative를 위한 행렬 구성
 ```
 
-### 2-4. 단위 테스트 (`notebooks/01_model_check.ipynb`)
+### 2-4. 단위 테스트 (`scripts/02_model_impl/model_check.ipynb`)
 
 CPU에서 소규모로 동작 확인:
 - BiEncoder forward pass shape 확인
@@ -153,81 +154,94 @@ CPU에서 소규모로 동작 확인:
 
 ## Phase 3: 학습
 
-공식 레포의 `train_dense_encoder.py`를 Hydra 설정과 함께 사용한다.
-설정 파일: `conf/train/biencoder_nq.yaml`
+**Phase 2에서 직접 구현한 `BiEncoder` + `in_batch_negative_loss`를 그대로 사용해 직접 학습 루프를 돈다.**
+공식 레포의 `train_dense_encoder.py`(Hydra 기반)는 사용하지 않는다 — Phase 4에서 만들 passage/question 임베딩이 이 체크포인트와 같은 벡터 공간을 공유해야 하므로, 학습부터 인덱스 구축까지 반드시 동일한 모델 코드로 이어져야 한다.
 
-### 실행 명령
+학습 스크립트: `scripts/03_train/train_kaggle.ipynb`
 
-```bash
-# 풀 학습 (8 GPU, 분산 학습)
-python -m torch.distributed.launch --nproc_per_node=8 \
-  train_dense_encoder.py \
-  train=biencoder_nq \
-  train_datasets=[nq_train] \
-  dev_datasets=[nq_dev] \
-  output_dir={체크포인트 저장 경로}
+### 학습 루프 구조
+
+```python
+model     = BiEncoder()
+optimizer = Adam(model.parameters(), lr=1e-5)
+scheduler = get_linear_schedule_with_warmup(...)
+
+for epoch in range(NUM_EPOCHS):
+    for batch in train_loader:  # NQDataset + DPRCollator
+        q_emb, p_emb = model(질문, positive)
+        h_emb, _     = model(질문, hard_negative)  # passage_encoder 재사용
+        loss = in_batch_negative_loss(q_emb, p_emb, h_emb)
+        loss.backward(); optimizer.step(); scheduler.step()
+    # dev_loader로 검증 loss 측정
 ```
 
 ### 하이퍼파라미터
 
-| 설정 | 논문/공식 레포 | 미니 실험 |
+| 설정 | 논문 기준 (MINI=False) | 미니 실험 (MINI=True) |
 |------|--------------|-----------|
-| Batch size | 128 (GPU당) | 32 |
+| Batch size | 128 | 32 |
 | Learning rate | 1e-5 | 1e-5 |
-| Epochs | 40 | 5~10 |
+| Epochs | 40 | 5 |
+| 학습 샘플 수 | NQ 전체 (~58,880) | 5,000 |
 | Hard negative | BM25 1개 | BM25 1개 |
 | Max passage length | 256 tokens | 256 tokens |
 | Max question length | 64 tokens | 64 tokens |
-| 검증 방식 | epoch 30까지 NLL loss, 이후 Average Rank | NLL loss |
+| 검증 방식 | dev set NLL loss | dev set NLL loss |
+
+> 공식 레포는 epoch 30 이후 Average Rank로 검증하지만, 재현 스코프에서는 NLL loss만으로 단순화한다.
 
 ### 학습 순서
 
-1. **미니 실험 (GPU 렌탈 초반)**: NQ 5K + 배치 32 → loss 감소 확인
-2. **풀 학습**: NQ 전체 58K + 배치 128 → 40 epochs (~1일 소요)
+1. **미니 실험 (GPU 렌탈 초반)**: `MINI=True` (NQ 5K, 배치 32, 5 epochs) → loss가 log(B) 근처에서 시작해 감소하는지 확인
+2. **풀 학습**: `MINI=False` (NQ 전체 58K, 배치 128, 40 epochs, ~1일 소요)
 
 ### 체크포인트
 
-- 공식 레포는 매 validation마다 저장, **보통 마지막 체크포인트가 best**
-- epoch ~25 이후부터 Average Rank가 25 이하로 수렴하는지 확인
+- `outputs/checkpoints/best.pt`에 `model.state_dict()` 저장 (question_encoder, passage_encoder 파라미터 모두 포함)
+- dev loss가 가장 낮은 epoch마다 덮어써서 best만 유지 (`train_kaggle.ipynb`에 구현 완료)
 
 ---
 
 ## Phase 4: 인덱스 구축 및 평가
 
-### 4-1. Passage 임베딩 추출
+**Phase 3에서 학습한 `BiEncoder` 체크포인트를 그대로 로드해서 사용한다.**
+공식 레포의 `generate_dense_embeddings.py` / `dense_retriever.py` 대신 `src/retriever/`에 직접 구현한다 — 직접 학습한 모델의 벡터 공간과 어긋나지 않으려면 임베딩 생성·검색 모두 같은 `question_encoder`/`passage_encoder`를 써야 하기 때문 (공식 스크립트는 공식 레포 자체 모델 클래스/체크포인트 포맷을 전제로 하므로 그대로 못 씀).
 
-공식 레포의 `generate_dense_embeddings.py` 사용. 샤딩으로 병렬 처리 가능.
+### 4-1. Passage 임베딩 추출 (`src/retriever/embed.py`)
 
-```bash
-python generate_dense_embeddings.py \
-  model_file={체크포인트 경로} \
-  ctx_src=dpr_wiki \
-  shard_id={0부터} num_shards={총 샤드 수} \
-  out_file={출력 경로 prefix} \
-  batch_size=128
+```python
+model = BiEncoder()
+model.load_state_dict(torch.load(checkpoint_path))
+passage_encoder = model.passage_encoder  # 이 부분만 사용
+
+# 21M wikipedia passage를 배치 단위로 인코딩 → (21M, 768)
 ```
 
 - 예상 크기: 21M × 768 × 4bytes ≈ 64GB
-- 단일 GPU면 shard 나눠서 순차 실행
+- 단일 GPU면 샤딩해서 `outputs/embeddings/`에 여러 파일로 나눠 저장 후 순차 실행
 
-### 4-2. FAISS 인덱스 구축 + Retrieval 평가
+### 4-2. FAISS 인덱스 구축 (`src/retriever/index.py`)
 
-공식 레포의 `dense_retriever.py`가 인덱스 구축과 평가를 함께 처리한다.
-
-```bash
-python dense_retriever.py \
-  model_file={체크포인트} \
-  qa_dataset=nq_test \
-  ctx_datatsets=[dpr_wiki] \
-  encoded_ctx_files=["{임베딩 파일 glob}"] \
-  out_file={결과 json 경로}
+```python
+import faiss
+index = faiss.IndexFlatIP(768)   # dot product 기반 exhaustive 검색
+index.add(passage_embeddings)    # (21M, 768)
 ```
 
-- 기본 인덱스: **exhaustive (flat)** — 정확도 최대
-- HNSW 옵션(`indexer=hnsw`): 검색 빠르지만 인덱스 구축 오래 걸리고 RAM 많이 씀
-- 재현 목적이므로 **flat 인덱스** 사용
+- **exhaustive (flat)** 인덱스 사용 — 정확도 최대, 재현 목적에 부합
+- HNSW는 검색은 빠르지만 근사 검색이라 정확한 재현 비교에는 flat이 더 적합
 
-### 4-3. 목표 수치
+### 4-3. Retrieval 평가 (`src/retriever/evaluate.py`)
+
+```python
+question_encoder = model.question_encoder  # 같은 체크포인트, 다른 절반
+
+q_emb = question_encoder(nq_test_questions)      # (N, 768)
+D, I = index.search(q_emb, k=100)                # FAISS top-k 검색
+# 정답 문자열이 top-k passage 안에 포함되는 비율 = Top-k accuracy
+```
+
+### 4-4. 목표 수치
 
 | | BM25 (논문) | DPR 논문 | 공식 레포 모델 | 재현 |
 |-|------------|---------|--------------|------|
