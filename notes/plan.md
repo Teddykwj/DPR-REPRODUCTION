@@ -157,7 +157,12 @@ CPU에서 소규모로 동작 확인:
 **Phase 2에서 직접 구현한 `BiEncoder` + `in_batch_negative_loss`를 그대로 사용해 직접 학습 루프를 돈다.**
 공식 레포의 `train_dense_encoder.py`(Hydra 기반)는 사용하지 않는다 — Phase 4에서 만들 passage/question 임베딩이 이 체크포인트와 같은 벡터 공간을 공유해야 하므로, 학습부터 인덱스 구축까지 반드시 동일한 모델 코드로 이어져야 한다.
 
-학습 스크립트: `scripts/03_train/train_kaggle.ipynb`
+학습 스크립트: `scripts/03_train/train.py` (GPU 렌탈 서버용 CLI 스크립트)
+- `python scripts/03_train/train.py --mini` → sanity check (NQ 5K, batch 32, 5 epochs)
+- `python scripts/03_train/train.py` → 풀 학습 (NQ 전체, batch 128, 40 epochs)
+- `--batch-size`로 GPU 메모리에 맞게 즉석 조정 가능
+
+> Kaggle 무료 GPU(T4/P100, ~14.5GB)에서는 batch 128이 AMP를 적용해도 OOM이 나서(질문+positive+hard negative 3-way forward × BERT-base 2개 구조가 메모리를 많이 씀), VRAM이 더 큰 렌탈 GPU(A100 40GB 등)로 전환. `scripts/03_train/train_kaggle.ipynb`는 Kaggle에서 짧은 sanity check 용도로 남겨둠.
 
 ### 학습 루프 구조
 

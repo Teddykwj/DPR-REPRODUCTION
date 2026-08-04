@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # GPU 서버에서 실행. 공식 DPR 레포의 download_data.py를 사용한다.
+# Phase 3(학습)만 필요하면: SKIP_WIKI=1 ./download_server.sh
+# Phase 4(임베딩 추출)까지 필요하면: ./download_server.sh (Wikipedia 21M passage, ~14GB 포함)
 set -euo pipefail
 
 DATA_DIR="${1:-./data}"
+SKIP_WIKI="${SKIP_WIKI:-0}"
 
 # ── 1. 공식 DPR 레포 클론 ──────────────────────────────────────────────────────
 if [ ! -d "DPR" ]; then
@@ -12,10 +15,14 @@ cd DPR
 pip install -e . -q
 
 # ── 2. Wikipedia passages (psgs_w100.tsv, ~14GB) ──────────────────────────────
-echo "[1/3] Downloading Wikipedia passages..."
-python data/download_data.py \
-    --resource data.wikipedia_split.psgs_w100 \
-    --output_dir "${DATA_DIR}/wikipedia"
+if [ "$SKIP_WIKI" = "1" ]; then
+    echo "[1/3] Skipping Wikipedia passages (SKIP_WIKI=1)"
+else
+    echo "[1/3] Downloading Wikipedia passages..."
+    python data/download_data.py \
+        --resource data.wikipedia_split.psgs_w100 \
+        --output_dir "${DATA_DIR}/wikipedia"
+fi
 
 # ── 3. NQ retriever 학습 데이터 (train/dev, JSON 포맷) ────────────────────────
 echo "[2/3] Downloading NQ retriever data..."
