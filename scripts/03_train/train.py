@@ -7,6 +7,11 @@
 """
 import argparse
 import os
+import sys
+from pathlib import Path
+
+# repo 루트를 sys.path에 추가 (scripts/03_train/train.py를 어디서 실행하든 `src` import 가능하게)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 from torch.utils.data import DataLoader
