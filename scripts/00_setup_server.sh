@@ -13,12 +13,17 @@ set -euo pipefail
 REPO_URL="https://github.com/Teddykwj/dpr-reproduction.git"
 
 if [ -f "src/models/biencoder.py" ]; then
-    echo "이미 repo 내부에서 실행 중 — clone 생략"
+    echo "이미 repo 내부에서 실행 중 — clone 생략, 최신 커밋으로 pull"
+    git pull
 else
-    if [ ! -d "dpr-reproduction/.git" ]; then
+    if [ -d "dpr-reproduction/.git" ]; then
+        echo "기존 clone 발견 — 최신 커밋으로 pull"
+        cd dpr-reproduction
+        git pull
+    else
         git clone "$REPO_URL" dpr-reproduction
+        cd dpr-reproduction
     fi
-    cd dpr-reproduction
 fi
 
 pip install -r requirements.txt -q
