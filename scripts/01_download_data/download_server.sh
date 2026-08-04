@@ -12,7 +12,10 @@ if [ ! -d "DPR" ]; then
     git clone https://github.com/facebookresearch/DPR.git
 fi
 cd DPR
-pip install -e . -q
+# pip install -e .는 최신 setuptools의 엄격해진 flat-layout 자동 탐지 때문에
+# 오래된 이 레포(setup.py가 packages를 명시하지 않음)에서 실패한다.
+# 레거시 경로(python setup.py develop)는 그 검증을 타지 않아 우회된다.
+python setup.py develop -q
 
 # ── 2. Wikipedia passages (psgs_w100.tsv, ~14GB) ──────────────────────────────
 if [ "$SKIP_WIKI" = "1" ]; then
